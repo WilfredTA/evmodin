@@ -4,6 +4,7 @@ use ethereum_types::{Address, H256, U256};
 use hex_literal::hex;
 use parking_lot::Mutex;
 use std::{cmp::min, collections::HashMap};
+use crate::tracing::NoopTracer;
 
 /// LOG record.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,7 +142,7 @@ impl crate::Host for MockedHost {
         value: H256,
     ) -> StorageStatus {
         self.recorded.lock().record_account_access(address);
-
+        println!("Set STORAGE CALLED: {:?} - key ... {:?} - value", key, value);
         // Get the reference to the old value.
         // This will create the account in case it was not present.
         // This is convenient for unit testing and standalone EVM execution to preserve the
@@ -158,6 +159,7 @@ impl crate::Host for MockedHost {
         // WARNING! This is not complete implementation as refund is not handled here.
 
         if old.value == value {
+            println!("OLD VAL == NEW VAL. NOT CHANGING");
             return StorageStatus::Unchanged;
         }
 
@@ -174,6 +176,7 @@ impl crate::Host for MockedHost {
             StorageStatus::ModifiedAgain
         };
 
+        println!("FOR ADDR: {:?}\nOLD VALUE: {:?}\nNEW VALUE: {:?}\n", address, old.value, value);
         old.value = value;
 
         status
@@ -241,18 +244,34 @@ impl crate::Host for MockedHost {
         });
     }
 
+    // Totally not thread safe
+    // Definitely breaks guarantees
+    // But sufficient for a quick demonstration of the concept
     fn call(&mut self, msg: &Message) -> Output {
-        let mut r = self.recorded.lock();
-
-        r.record_account_access(msg.destination);
-
-        if r.calls.len() < MAX_RECORDED_CALLS {
-            r.calls.push(msg.clone());
-            let call_msg = msg;
-            if !call_msg.input_data.is_empty() {
-                r.call_inputs.push(call_msg.input_data.clone());
-            }
+        let dest = msg.destination;
+        if let Some(contract) = self.accounts.get(&dest) {
+            let dest_contract = AnalyzedCode::analyze(contract.code.clone().to_vec());
+            let mut new_self = self.clone();
+            let output = dest_contract
+                .execute(&mut new_self,
+                         &mut NoopTracer,
+                         None,
+                         msg.clone(),
+                        Revision::latest());
+            self.call_result = output;
+            self.accounts = new_self.accounts.clone();
         }
+        // let mut r = self.recorded.lock();
+        //
+        // r.record_account_access(msg.destination);
+        //
+        // if r.calls.len() < MAX_RECORDED_CALLS {
+        //     r.calls.push(msg.clone());
+        //     let call_msg = msg;
+        //     if !call_msg.input_data.is_empty() {
+        //         r.call_inputs.push(call_msg.input_data.clone());
+        //     }
+        // }
         self.call_result.clone()
     }
 
