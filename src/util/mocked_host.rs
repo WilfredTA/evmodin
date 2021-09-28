@@ -1,10 +1,13 @@
 use crate::{host::*, *};
 use bytes::Bytes;
-use ethereum_types::{Address, H256, U256};
+use ethereum_types::{Address, H256,H160, U256};
 use hex_literal::hex;
 use parking_lot::Mutex;
 use std::{cmp::min, collections::HashMap};
+use sha3::{Digest, Keccak256};
+use rlp::encode;
 use crate::tracing::NoopTracer;
+
 
 /// LOG record.
 #[derive(Clone, Debug, PartialEq)]
@@ -159,7 +162,6 @@ impl crate::Host for MockedHost {
         // WARNING! This is not complete implementation as refund is not handled here.
 
         if old.value == value {
-            println!("OLD VAL == NEW VAL. NOT CHANGING");
             return StorageStatus::Unchanged;
         }
 
@@ -176,7 +178,7 @@ impl crate::Host for MockedHost {
             StorageStatus::ModifiedAgain
         };
 
-        println!("FOR ADDR: {:?}\nOLD VALUE: {:?}\nNEW VALUE: {:?}\n", address, old.value, value);
+
         old.value = value;
 
         status
@@ -244,34 +246,110 @@ impl crate::Host for MockedHost {
         });
     }
 
-    // Totally not thread safe
-    // Definitely breaks guarantees
-    // But sufficient for a quick demonstration of the concept
+    // To do:
+    // 1. Calculate new contract address and code hash -- done
+    // 2. Use correct Tracer and Revision
+    // 3. Support static call
+
     fn call(&mut self, msg: &Message) -> Output {
-        let dest = msg.destination;
-        if let Some(contract) = self.accounts.get(&dest) {
-            let dest_contract = AnalyzedCode::analyze(contract.code.clone().to_vec());
-            let mut new_self = self.clone();
-            let output = dest_contract
-                .execute(&mut new_self,
-                         &mut NoopTracer,
-                         None,
-                         msg.clone(),
-                        Revision::latest());
-            self.call_result = output;
-            self.accounts = new_self.accounts.clone();
+        println!("CALL EXECUTING");
+        let destination = msg.destination;
+        match self.accounts.get(&destination) {
+            Some(account) => {
+                println!("MSG {:?}, account: {:?}",msg, account);
+                if !account.code.is_empty() {
+                    let msg = msg.clone();
+                    let dest_contract = AnalyzedCode::analyze(account.code.as_ref());
+                    let mut local_self = self.clone();
+                    let output = dest_contract.execute(
+                        &mut local_self,
+                            &mut NoopTracer,
+                            None,
+                            msg.clone(),
+                            Revision::Istanbul
+                    );
+                    self.accounts = local_self.accounts;
+                    // TO DO:
+                    // The call_result here when msg.is_static is true
+                    // is meaningless junk data
+                    self.call_result = output;
+                    if msg.is_static {
+                        dbg!("STATIC CALL", &msg);
+                        dbg!("CALL RESULT", &self.call_result);
+                    }
+                }
+            }
+
+            None => {
+                if msg.destination == H160::zero() {
+                    //println!("MSG DESTINATION IS ZERO: {:?}", msg);
+                    let sender_acc = self.accounts.get(&msg.sender).unwrap();
+                    let nonce = sender_acc.nonce;
+                    let addr = msg.sender.clone();
+                    let encoded = rlp::encode_list::<&[u8],&[u8]>(&[addr.as_bytes(), &nonce.to_be_bytes()]);
+                    let mut hasher = Keccak256::new();
+                    hasher.update(encoded);
+                    let final_hash = hasher.finalize();
+                    let contract_addr = final_hash.to_vec();
+                    let calced_addr: H160 = Address::from_slice(&contract_addr[12..]);
+                    let mut local_self = self.clone();
+
+
+                    // Execute deployment code
+                    // Set return value to new account at new address
+                    // Copy storage over
+                    let acc = Account {
+                        code: msg.input_data.clone(),
+                        code_hash: H256::zero(),
+                        nonce: 1,
+                        balance: msg.value,
+                        storage: Default::default(),
+                    };
+                    local_self.accounts.insert(Address::zero(), acc.clone());
+
+                    let ctr_code = AnalyzedCode::analyze(acc.code.as_ref());
+
+                    // Since account at address zero will not be None, this match arm
+                    // will not execute again
+                    let ctr_output = ctr_code.execute(
+                        &mut local_self, &mut NoopTracer, None, msg.clone(),Revision::Istanbul);
+
+                    //println!("OUTPUT OF CONSTRUCTOR: {:?}", ctr_output);
+
+                    let new_contract_code = ctr_output.clone().output_data;
+                    let mut code_hasher = Keccak256::new();
+                    code_hasher.update(&new_contract_code.to_vec());
+                    let new_code_hash = code_hasher.finalize().to_vec();
+                    // Ensures zero address is not included as actual account
+                    // Copies generated contract's storage values in case its constructor writes
+                    local_self.accounts.iter().for_each(|(addr, acc)| {
+                        if addr == &Address::zero() {
+                            //println!("DEPLOYED STORAGE: {:?}", acc.clone().storage);
+                            let deployed_account = Account {
+                                code: new_contract_code.clone(),
+                                code_hash: H256::from_slice(&new_code_hash),
+                                nonce: 0,
+                                balance: msg.value,
+                                storage: acc.clone().storage
+                            };
+                            self.accounts.insert(calced_addr.clone(), deployed_account);
+                        } else {
+                            //println!("INSERTING INTO SELF: {:?}", addr);
+                            self.accounts.insert(*addr, acc.clone());
+                        }
+                    });
+
+
+                    // Set call result
+                    self.call_result = Output {
+                        status_code: StatusCode::Success,
+                        gas_left: ctr_output.gas_left,
+                        output_data: vec![].into(),
+                        create_address: Some(calced_addr)
+                    };
+                }
+            }
         }
-        // let mut r = self.recorded.lock();
-        //
-        // r.record_account_access(msg.destination);
-        //
-        // if r.calls.len() < MAX_RECORDED_CALLS {
-        //     r.calls.push(msg.clone());
-        //     let call_msg = msg;
-        //     if !call_msg.input_data.is_empty() {
-        //         r.call_inputs.push(call_msg.input_data.clone());
-        //     }
-        // }
         self.call_result.clone()
     }
 
